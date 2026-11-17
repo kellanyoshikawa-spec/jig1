@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fatigue Rig Collector</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2228; --muted:#5f6b77; --ok:#1a7f37; --okbg:#e6f4ea; --bad:#b42318; --badbg:#fdecea; --line:#d9dee4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14171a; --card:#1d2126; --text:#e8ebee; --muted:#9aa4ae; --ok:#3fb950; --okbg:#173022; --bad:#ff7b72; --badbg:#3a1d1d; --line:#2d333a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px -apple-system, system-ui, sans-serif; }
+  main { max-width:520px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  #go { width:100%; font-size:20px; font-weight:600; padding:20px; border:0; border-radius:14px; background:var(--ok); color:#fff; }
+  #go:disabled { opacity:.6; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-top:16px; }
+  #steps div { padding:4px 0; color:var(--muted); }
+  #steps div.now { color:var(--text); font-weight:600; }
+  #steps div.done::before { content:"\2713  "; color:var(--ok); }
+  #result { display:none; white-space:pre-wrap; }
+  #result.ok { display:block; background:var(--okbg); }
+  #result.bad { display:block; background:var(--badbg); color:var(--bad); }
+  #last { color:var(--muted); font-size:14px; margin-top:12px; }
+  details { margin-top:24px; color:var(--muted); }
+  label { display:block; margin:12px 0 4px; font-size:14px; }
+  input { width:100%; font-size:15px; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--text); }
+  .small { font-size:14px; padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); margin-top:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Fatigue rig</h1>
+  <p class="sub">Stand near the rig, then tap the button. Takes about 30 seconds.</p>
+
+  <button id="go">Collect &amp; upload</button>
+
+  <div class="card" id="stepsCard" style="display:none">
+    <div id="steps"></div>
+  </div>
+  <div class="card" id="result"></div>
+  <div id="last"></div>
+
+  <details>
+    <summary>Settings</summary>
+    <label for="url">Google script URL (ends in /exec)</label>
+    <input id="url" autocomplete="off">
+    <label for="key">Upload key</label>
+    <input id="key" autocomplete="off">
+    <button class="small" id="save">Save settings</button>
+    <button class="small" id="test">Test Google connection</button>
+  </details>
+</main>
+
+<script>
+// ---- defaults (the key is entered once on the phone, not stored in this file)
+const DEFAULT_URL = 'https://script.google.com/macros/s/AKfycbxCYOVM6_Pd-8hx9XWVNuiWfeR_nt29iqd5fvY682Q4g_yByNRJs6Um6TCa_ZEpi-Ql/exec';
+const NUS = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // phone -> board
+const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // board -> phone
+
+const $ = id => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+};
+
+// key can also come from the bookmark link: ...index.html?key=XXXX
+const params = new URLSearchParams(location.search);
+if (params.get('key')) store.set('key', params.get('key'));
+$('url').value = store.get('url') || DEFAULT_URL;
+$('key').value = store.get('key') || '';
+showLast();
+
+$('save').onclick = () => { store.set('url', $('url').value.trim()); store.set('key', $('key').value.trim()); result('Settings saved.', true); };
+$('test').onclick = async () => {
+  try { const r = await postToGoogle({ ping: true }); result('Google connection OK (' + r + ')', true); }
+  catch (e) { result('Google connection failed: ' + e.message, false); }
+};
+$('go').onclick = run;
+
+// ---- UI helpers
+const STEPS = ['Connect to the rig', 'Download new data', 'Upload to Google', 'Confirm with the rig'];
+function steps(active) {
+  $('stepsCard').style.display = 'block';
+  $('steps').innerHTML = STEPS.map((s, i) =>
+    '<div class="' + (i < active ? 'done' : i === active ? 'now' : '') + '">' + s + '</div>').join('');
+}
+function result(msg, ok) { const r = $('result'); r.textContent = msg; r.className = 'card ' + (ok ? 'ok' : 'bad'); }
+function showLast() {
+  const t = store.get('lastOk');
+  $('last').textContent = t ? 'Last successful upload: ' + t : '';
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ---- Google
+async function postToGoogle(payload) {
+  const url = ($('url').value || DEFAULT_URL).trim();
+  const key = $('key').value.trim();
+  if (!key) throw new Error('enter the upload key under Settings');
+  payload.key = key;
+  // plain-text body keeps this a "simple" request that Google accepts from a web page
+  const resp = await fetch(url, { method: 'POST', body: JSON.stringify(payload) });
+  const text = (await resp.text()).trim();
+  if (!text.startsWith('ok')) throw new Error(text.slice(0, 200) || ('HTTP ' + resp.status));
+  return text.replace(/^ok\s*/, '');
+}
+
+// ---- Bluetooth
+let device = null;
+async function run() {
+  if (!navigator.bluetooth) {
+    result('This browser can\'t use Bluetooth.\niPhone: open this page in the free "Bluefy" app.\nAndroid: open it in Chrome.', false);
+    return;
+  }
+  if (!$('key').value.trim()) { result('Enter the upload key under Settings first.', false); return; }
+
+  $('go').disabled = true;
+  $('result').className = 'card';
+  let lines = [];
+  let buf = '';
+  let collecting = false;
+  let listeners = [];
+  const onLine = line => {
+    if (line.startsWith('# ----- begin data')) { collecting = true; lines = []; }
+    else if (collecting && !line.startsWith('#') && line.trim()) lines.push(line.trim());
+    listeners.forEach(f => f(line));
+  };
+  const waitForLine = (test, ms) => new Promise((resolve, reject) => {
+    const t = setTimeout(() => { listeners = listeners.filter(f => f !== h); reject(new Error('the rig stopped answering')); }, ms);
+    const h = line => { if (test(line)) { clearTimeout(t); listeners = listeners.filter(f => f !== h); resolve(line); } };
+    listeners.push(h);
+  });
+
+  try {
+    steps(0);
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'FatigueRig' }, { services: [NUS] }],
+      optionalServices: [NUS]
+    });
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(NUS);
+    const rx = await svc.getCharacteristic(RX);
+    const tx = await svc.getCharacteristic(TX);
+    const dec = new TextDecoder();
+    tx.addEventListener('characteristicvaluechanged', ev => {
+      buf += dec.decode(ev.target.value);
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) { onLine(buf.slice(0, i).replace(/\r$/, '')); buf = buf.slice(i + 1); }
+    });
+    await tx.startNotifications();
+    const enc = new TextEncoder();
+    const cmd = async s => {
+      const data = enc.encode(s + '\n');
+      if (rx.writeValueWithResponse) await rx.writeValueWithResponse(data); else await rx.writeValue(data);
+    };
+    await sleep(2200);                                   // let the rig's greeting finish
+
+    steps(1);
+    await cmd('send');
+    const endLine = await waitForLine(l => l.startsWith('# ----- end'), 120000);
+    const count = lines.length;
+
+    steps(2);
+    let report = 'No new data since the last collection.';
+    if (count > 0) {
+      const text = 'lc,test,cycle\n' + lines.join('\n');
+      report = await postToGoogle({ text });
+    }
+
+    steps(3);
+    await cmd('ack');
+    await waitForLine(l => l.startsWith('# ack'), 15000);
+    steps(4);
+
+    const when = new Date().toLocaleString();
+    store.set('lastOk', when + ' (' + count + ' data points)');
+    showLast();
+    result('Done - ' + count + ' data point(s) uploaded.\n' + report, true);
+  } catch (e) {
+    let msg = e && e.message ? e.message : String(e);
+    if (e && e.name === 'NotFoundError') msg = 'No rig selected. Tap the button again and choose "FatigueRig".';
+    result('Not finished: ' + msg + '\nNothing was lost - just tap the button again.', false);
+  } finally {
+    try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch (e) {}
+    $('go').disabled = false;
+  }
+}
+</script>
+</body>
+</html>
